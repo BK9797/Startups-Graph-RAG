@@ -456,4 +456,4 @@ RETURN p.name, collect(DISTINCT fc.name) AS founded,
        collect(DISTINCT aw.name) AS awards;
 ```
 
-![Alt text](path/to/image.png)
+![data](image.png)
