@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import logging
 
-from groq import Groq
+try:
+    from groq import Groq
+except ModuleNotFoundError:  # pragma: no cover - exercised in lightweight environments
+    Groq = None  # type: ignore[assignment]
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import get_settings
@@ -21,6 +24,8 @@ _client: Groq | None = None
 def get_groq_client() -> Groq:
     global _client
     if _client is None:
+        if Groq is None:
+            raise ImportError("The 'groq' package is required to call the LLM.")
         settings = get_settings()
         _client = Groq(api_key=settings.groq_api_key)
     return _client

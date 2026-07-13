@@ -13,8 +13,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from neo4j import GraphDatabase, basic_auth
-from neo4j.exceptions import Neo4jError, ServiceUnavailable
+try:
+    from neo4j import GraphDatabase, basic_auth
+    from neo4j.exceptions import Neo4jError, ServiceUnavailable
+except ModuleNotFoundError:  # pragma: no cover - exercised in lightweight environments
+    GraphDatabase = None
+    basic_auth = None
+    Neo4jError = Exception
+    ServiceUnavailable = Exception
 
 from app.config import get_settings
 
@@ -23,6 +29,9 @@ logger = logging.getLogger("app.neo4j")
 
 class Neo4jClient:
     def __init__(self) -> None:
+        if GraphDatabase is None or basic_auth is None:
+            raise ImportError("The 'neo4j' package is required to connect to Neo4j.")
+
         settings = get_settings()
         self._driver = GraphDatabase.driver(
             settings.neo4j_uri,

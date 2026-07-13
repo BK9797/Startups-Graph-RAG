@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 
 from app.config import get_settings
 from app.core.cypher_library import CypherMatch, match_question
+from app.core.embedding import find_best_matches
 from app.core.llm import chat_completion
 from app.core.prompts import ANSWER_SYSTEM_PROMPT, ANSWER_USER_TEMPLATE
 from app.db.neo4j_client import Neo4jClient
@@ -117,6 +118,28 @@ def fallback_entity_search(db: Neo4jClient, question: str) -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         logger.info("Fulltext fallback failed (index may not exist yet): %s", exc)
         return []
+
+
+def embedding_fallback_search(db: Neo4jClient, question: str) -> list[dict]:
+    """Use deterministic embeddings to rank entity names when fulltext search is unavailable."""
+    try:
+        rows = db.run_read(
+            "MATCH (n) WHERE n.name IS NOT NULL AND labels(n)[0] IN ['Company', 'Person', 'Investor', 'Product', 'Award'] "
+            "RETURN labels(n)[0] AS label, n.name AS name LIMIT 200"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Embedding fallback failed: %s", exc)
+        return []
+
+    names = [row.get("name") for row in rows if isinstance(row.get("name"), str)]
+    if not names:
+        return []
+
+    ranked = find_best_matches(question, names, top_k=8)
+    return [
+        {"label": "Entity", "name": name, "score": round(score, 4), "source": "embedding"}
+        for score, name in ranked
+    ]
 
 
 SUBGRAPH_QUERY_TEMPLATE = """
@@ -240,15 +263,27 @@ def answer_question(
         # straight to the fulltext fallback rather than running nothing.
         fallback_rows = fallback_entity_search(db, question)
         if not fallback_rows:
+            fallback_rows = embedding_fallback_search(db, question)
+        if not fallback_rows:
             return _unanswerable_result(question, answer_model, warnings, start)
-        warnings.append(
-            "No predefined Cypher query template matched this question; showing "
-            "closest-matching entities from a fulltext search instead."
-        )
-        cypher, cypher_params = FULLTEXT_FALLBACK_QUERY.strip(), {"term": _fallback_search_term(question) + "~"}
+
+        if fallback_rows and fallback_rows[0].get("source") == "embedding":
+            warnings.append(
+                "No predefined Cypher query template matched this question; showing "
+                "closest-matching entities from an embedding-based similarity search instead."
+            )
+            cypher, cypher_params = FULLTEXT_FALLBACK_QUERY.strip(), {"term": _fallback_search_term(question) + "~"}
+            template_id, template_description = "embedding_fallback", "Embedding-based entity search over graph node names."
+        else:
+            warnings.append(
+                "No predefined Cypher query template matched this question; showing "
+                "closest-matching entities from a fulltext search instead."
+            )
+            cypher, cypher_params = FULLTEXT_FALLBACK_QUERY.strip(), {"term": _fallback_search_term(question) + "~"}
+            template_id, template_description = "fulltext_fallback", "Fulltext search over node names/descriptions."
+
         results = fallback_rows
         used_fallback = True
-        template_id, template_description = "fulltext_fallback", "Fulltext search over node names/descriptions."
     else:
         cypher = match.cypher
         cypher_params = {**match.params, "limit": max_rows}
@@ -270,12 +305,20 @@ def answer_question(
         used_fallback = False
         if not results:
             fallback_rows = fallback_entity_search(db, question)
+            if not fallback_rows:
+                fallback_rows = embedding_fallback_search(db, question)
             if fallback_rows:
                 used_fallback = True
-                warnings.append(
-                    "The matched query returned no rows; showing closest-matching "
-                    "entities from a fulltext search instead."
-                )
+                if fallback_rows and fallback_rows[0].get("source") == "embedding":
+                    warnings.append(
+                        "The matched query returned no rows; showing closest-matching "
+                        "entities from an embedding-based search instead."
+                    )
+                else:
+                    warnings.append(
+                        "The matched query returned no rows; showing closest-matching "
+                        "entities from a fulltext search instead."
+                    )
                 results = fallback_rows
 
     if any(row.get("data_quality") == "placeholder" for row in results if isinstance(row, dict)):

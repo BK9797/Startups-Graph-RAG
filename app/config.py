@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     groq_answer_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_ANSWER_MODEL")
     groq_temperature_answer: float = Field(default=0.2, alias="GROQ_TEMPERATURE_ANSWER")
 
+    # --- Embedding retrieval ---
+    embedding_model: str = Field(default="BAAI/bge-small-en-v1.5", alias="EMBEDDING_MODEL")
+
     # --- App ---
     app_env: str = Field(default="development", alias="APP_ENV")
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
