@@ -229,33 +229,6 @@ make test
 
 ---
 
-# 📷 Screenshots
-
-> Add screenshots of your application here.
-
-## 🏠 Streamlit Interface
-
-```md
-![Streamlit UI](images/streamlit-ui.png)
-```
-
----
-
-## 🔍 API Documentation
-
-```md
-![Swagger](images/swagger.png)
-```
-
----
-
-## 🕸️ Neo4j Graph
-
-```md
-![Neo4j Graph](images/neo4j-graph.png)
-```
-
----
 
 # 📌 Key Design Decisions
 
@@ -277,23 +250,11 @@ The language model never writes Cypher queries or directly interacts with the da
 
 ---
 
-# 🚀 Future Improvements
-
-- Hybrid Vector + Graph Retrieval
-- Conversation Memory
-- Multi-hop Graph Reasoning
-- Graph Visualization
-- Docker Support
-- Authentication & Authorization
-- Advanced Ranking Algorithms
-
----
-
 # 👨‍💻 Author
 
 **Bishoy Kamel**
 
-AI Engineer | Backend Developer | GraphRAG Enthusiast
+AI Engineer
 
 - 💼 LinkedIn: https://www.linkedin.com/in/bishoy-kamel-5b53a6254/
 - 🐙 GitHub: https://github.com/BK9797
