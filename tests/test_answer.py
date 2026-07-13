@@ -1,0 +1,89 @@
+"""Tests for POST /answer, and for the Cypher safety validator."""
+
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from app.core.graph_rag import validate_cypher
+from app.db.neo4j_client import get_neo4j_client
+from app.main import app
+
+
+def test_validate_cypher_rejects_write_queries():
+    result = validate_cypher("MATCH (n) DETACH DELETE n RETURN n LIMIT 1")
+    assert result.valid is False
+
+
+def test_validate_cypher_rejects_missing_return():
+    result = validate_cypher("MATCH (n:Company) LIMIT 5")
+    assert result.valid is False
+
+
+def test_validate_cypher_rejects_missing_limit():
+    result = validate_cypher("MATCH (c:Company) RETURN c.name")
+    assert result.valid is False
+
+
+def test_validate_cypher_accepts_clean_read_query_with_literal_limit():
+    result = validate_cypher("MATCH (c:Company) RETURN c.name LIMIT 10")
+    assert result.valid is True
+
+
+def test_validate_cypher_accepts_parameterized_limit():
+    result = validate_cypher("MATCH (c:Company) RETURN c.name LIMIT $limit")
+    assert result.valid is True
+
+
+def test_answer_endpoint_end_to_end(fake_neo4j_client):
+    """A question that matches the founders_of_company template runs the
+    template's Cypher (never LLM-generated) and synthesizes an answer."""
+    app.dependency_overrides[get_neo4j_client] = lambda: fake_neo4j_client
+    client = TestClient(app)
+
+    with patch("app.core.graph_rag.synthesize_answer", return_value="Elena Rossi founded NovaPay in 2016."):
+        resp = client.post("/answer", json={"question": "Who founded NovaPay?"})
+
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"] == "Elena Rossi founded NovaPay in 2016."
+    assert body["cypher_valid"] is True
+    assert body["template_id"] == "founders_of_company"
+    assert body["cypher_params"]["name"] == "NovaPay"
+    assert body["row_count"] == 1
+
+
+def test_answer_endpoint_falls_back_to_fulltext_when_no_template_matches(fake_neo4j_client):
+    """A question that matches no fixed template goes straight to the
+    fulltext fallback search instead of running nothing."""
+    fake_neo4j_client.run_read.return_value = [{"label": "Company", "name": "NovaPay", "score": 1.0}]
+    app.dependency_overrides[get_neo4j_client] = lambda: fake_neo4j_client
+    client = TestClient(app)
+
+    with patch("app.core.graph_rag.synthesize_answer", return_value="Closest match: NovaPay."):
+        resp = client.post("/answer", json={"question": "asdkjaslkdjaslkd random gibberish"})
+
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["template_id"] == "fulltext_fallback"
+    assert body["used_fallback_search"] is True
+    assert any("No predefined Cypher query template matched" in w for w in body["warnings"])
+
+
+def test_answer_endpoint_never_runs_when_neo4j_and_search_both_find_nothing(fake_neo4j_client):
+    fake_neo4j_client.run_read.return_value = []
+    app.dependency_overrides[get_neo4j_client] = lambda: fake_neo4j_client
+    client = TestClient(app)
+
+    resp = client.post("/answer", json={"question": "asdkjaslkdjaslkd random gibberish"})
+
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cypher_valid"] is False
+    assert body["row_count"] == 0
+    assert body["template_id"] is None

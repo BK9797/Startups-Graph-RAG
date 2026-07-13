@@ -1,0 +1,49 @@
+"""
+Thin wrapper around the Groq chat completions API, with retry logic and
+a consistent interface so `graph_rag.py` doesn't need to know about the
+Groq SDK directly.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from groq import Groq
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from app.config import get_settings
+
+logger = logging.getLogger("app.llm")
+
+_client: Groq | None = None
+
+
+def get_groq_client() -> Groq:
+    global _client
+    if _client is None:
+        settings = get_settings()
+        _client = Groq(api_key=settings.groq_api_key)
+    return _client
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4))
+def chat_completion(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    temperature: float = 0.0,
+    max_tokens: int = 1024,
+) -> str:
+    """Single-turn chat completion. Retries on transient Groq/network errors."""
+    client = get_groq_client()
+    response = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    content = response.choices[0].message.content or ""
+    return content.strip()
