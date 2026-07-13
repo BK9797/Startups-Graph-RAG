@@ -20,8 +20,7 @@ class Settings(BaseSettings):
 
     # --- Groq LLM ---
     # Used for exactly one thing: synthesizing a natural-language answer
-    # from already-retrieved graph rows. Cypher is never LLM-generated —
-    # see app/core/cypher_library.py.
+    # from already-retrieved graph rows. The LLM does not generate Cypher.
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     groq_answer_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_ANSWER_MODEL")
     groq_temperature_answer: float = Field(default=0.2, alias="GROQ_TEMPERATURE_ANSWER")

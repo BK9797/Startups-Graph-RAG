@@ -35,8 +35,8 @@ def test_validate_cypher_accepts_parameterized_limit():
 
 
 def test_answer_endpoint_end_to_end(fake_neo4j_client):
-    """A question that matches the founders_of_company template runs the
-    template's Cypher (never LLM-generated) and synthesizes an answer."""
+    """An embedding-based similarity search returns candidate entities and the answer is synthesized from them."""
+    fake_neo4j_client.run_read.return_value = [{"label": "Company", "name": "NovaPay"}]
     app.dependency_overrides[get_neo4j_client] = lambda: fake_neo4j_client
     client = TestClient(app)
 
@@ -49,15 +49,13 @@ def test_answer_endpoint_end_to_end(fake_neo4j_client):
     body = resp.json()
     assert body["answer"] == "Elena Rossi founded NovaPay in 2016."
     assert body["cypher_valid"] is True
-    assert body["template_id"] == "founders_of_company"
-    assert body["cypher_params"]["name"] == "NovaPay"
+    assert body["template_id"] == "embedding"
     assert body["row_count"] == 1
 
 
-def test_answer_endpoint_falls_back_to_fulltext_when_no_template_matches(fake_neo4j_client):
-    """A question that matches no fixed template goes straight to the
-    fulltext fallback search instead of running nothing."""
-    fake_neo4j_client.run_read.return_value = [{"label": "Company", "name": "NovaPay", "score": 1.0}]
+def test_answer_endpoint_uses_embedding_similarity_when_no_direct_match(fake_neo4j_client):
+    """A question with no exact entity match is answered using embedding-based similarity retrieval."""
+    fake_neo4j_client.run_read.return_value = [{"label": "Company", "name": "NovaPay"}]
     app.dependency_overrides[get_neo4j_client] = lambda: fake_neo4j_client
     client = TestClient(app)
 
@@ -68,9 +66,9 @@ def test_answer_endpoint_falls_back_to_fulltext_when_no_template_matches(fake_ne
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["template_id"] == "fulltext_fallback"
+    assert body["template_id"] == "embedding"
     assert body["used_fallback_search"] is True
-    assert any("No predefined Cypher query template matched" in w for w in body["warnings"])
+    assert any("embedding-based similarity search" in w for w in body["warnings"])
 
 
 def test_answer_endpoint_never_runs_when_neo4j_and_search_both_find_nothing(fake_neo4j_client):

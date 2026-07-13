@@ -29,7 +29,6 @@ import time
 from dataclasses import dataclass, field
 
 from app.config import get_settings
-from app.core.cypher_library import CypherMatch, match_question
 from app.core.embedding import find_best_matches
 from app.core.llm import chat_completion
 from app.core.prompts import ANSWER_SYSTEM_PROMPT, ANSWER_USER_TEMPLATE
@@ -62,8 +61,7 @@ class RagResult:
     cypher: str
     cypher_params: dict = field(default_factory=dict)
     cypher_valid: bool = True
-    template_id: str | None = None
-    template_description: str | None = None
+    retrieval_mode: str | None = None
     results: list[dict] = field(default_factory=list)
     used_fallback_search: bool = False
     warnings: list[str] = field(default_factory=list)
@@ -227,8 +225,7 @@ def _unanswerable_result(question: str, answer_model: str, warnings: list[str], 
         cypher="",
         cypher_params={},
         cypher_valid=False,
-        template_id=None,
-        template_description=None,
+        retrieval_mode=None,
         results=[],
         warnings=warnings,
         answer=(
@@ -256,70 +253,18 @@ def answer_question(
     max_rows = max(1, min(top_k, settings.max_cypher_rows))
     warnings: list[str] = []
 
-    match: CypherMatch | None = match_question(question)
+    fallback_rows = embedding_fallback_search(db, question)
+    if not fallback_rows:
+        return _unanswerable_result(question, answer_model, warnings, start)
 
-    if match is None:
-        # No fixed template recognized this question at all -- go
-        # straight to the fulltext fallback rather than running nothing.
-        fallback_rows = fallback_entity_search(db, question)
-        if not fallback_rows:
-            fallback_rows = embedding_fallback_search(db, question)
-        if not fallback_rows:
-            return _unanswerable_result(question, answer_model, warnings, start)
+    warnings.append(
+        "Showing closest-matching entities from an embedding-based similarity search."
+    )
+    cypher, cypher_params = "", {}
+    retrieval_mode = "embedding"
 
-        if fallback_rows and fallback_rows[0].get("source") == "embedding":
-            warnings.append(
-                "No predefined Cypher query template matched this question; showing "
-                "closest-matching entities from an embedding-based similarity search instead."
-            )
-            cypher, cypher_params = FULLTEXT_FALLBACK_QUERY.strip(), {"term": _fallback_search_term(question) + "~"}
-            template_id, template_description = "embedding_fallback", "Embedding-based entity search over graph node names."
-        else:
-            warnings.append(
-                "No predefined Cypher query template matched this question; showing "
-                "closest-matching entities from a fulltext search instead."
-            )
-            cypher, cypher_params = FULLTEXT_FALLBACK_QUERY.strip(), {"term": _fallback_search_term(question) + "~"}
-            template_id, template_description = "fulltext_fallback", "Fulltext search over node names/descriptions."
-
-        results = fallback_rows
-        used_fallback = True
-    else:
-        cypher = match.cypher
-        cypher_params = {**match.params, "limit": max_rows}
-        template_id, template_description = match.template_id, match.description
-
-        validation = validate_cypher(cypher)
-        if not validation.valid:
-            # Should be unreachable for a library query -- kept as a hard
-            # safety net in case a future template is added incorrectly.
-            warnings.append(f"Matched template failed the read-only safety check ({validation.reason}).")
-            return _unanswerable_result(question, answer_model, warnings, start)
-
-        try:
-            results = db.run_read(cypher, cypher_params)
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(f"Cypher execution error: {exc}")
-            results = []
-
-        used_fallback = False
-        if not results:
-            fallback_rows = fallback_entity_search(db, question)
-            if not fallback_rows:
-                fallback_rows = embedding_fallback_search(db, question)
-            if fallback_rows:
-                used_fallback = True
-                if fallback_rows and fallback_rows[0].get("source") == "embedding":
-                    warnings.append(
-                        "The matched query returned no rows; showing closest-matching "
-                        "entities from an embedding-based search instead."
-                    )
-                else:
-                    warnings.append(
-                        "The matched query returned no rows; showing closest-matching "
-                        "entities from a fulltext search instead."
-                    )
-                results = fallback_rows
+    results = fallback_rows
+    used_fallback = True
 
     if any(row.get("data_quality") == "placeholder" for row in results if isinstance(row, dict)):
         warnings.append("Some results reference placeholder nodes created from incomplete source data.")
@@ -337,8 +282,7 @@ def answer_question(
         cypher=cypher,
         cypher_params=cypher_params,
         cypher_valid=True,
-        template_id=template_id,
-        template_description=template_description,
+        retrieval_mode=retrieval_mode,
         results=results,
         used_fallback_search=used_fallback,
         warnings=warnings,

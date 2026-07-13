@@ -56,7 +56,7 @@ class AnswerResponse(BaseModel):
     cypher: str
     cypher_params: dict[str, Any] = Field(default_factory=dict)
     cypher_valid: bool
-    template_id: str | None = Field(default=None, description="Id of the matched query template in app/core/cypher_library.py.")
+    template_id: str | None = Field(default=None, description="Retrieval mode used for the answer.")
     template_description: str | None = None
     row_count: int
     results: list[dict[str, Any]]

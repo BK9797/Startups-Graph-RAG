@@ -178,9 +178,8 @@ with st.sidebar:
 
 st.title("Tech / Startups Knowledge Graph — Ask Anything")
 st.caption(
-    "Ask a natural-language question. It's matched against a fixed library of read-only Cypher "
-    "templates (no LLM writes Cypher), run against Neo4j, and answered by an LLM grounded "
-    "strictly in the retrieved graph data."
+    "Ask a natural-language question. The app retrieves relevant graph entities with embedding "
+    "and fulltext similarity search, then uses an LLM to answer from the retrieved graph context."
 )
 
 for turn in st.session_state.history:
@@ -226,7 +225,7 @@ if st.session_state.pending_question:
 if question:
     with st.chat_message("user"):
         st.markdown(question)
-    with st.chat_message("assistant"), st.spinner("Matching a Cypher template, querying Neo4j, and synthesizing an answer…"):
+    with st.chat_message("assistant"), st.spinner("Retrieving relevant graph entities and synthesizing an answer…"):
         try:
             t0 = time.time()
             data = call_answer(
