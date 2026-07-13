@@ -4,8 +4,7 @@ Prompt templates for the single LLM call in the pipeline:
   ANSWER_SYSTEM_PROMPT — retrieved graph rows -> grounded natural
   language answer, with explicit citation/no-hallucination rules.
 
-There is deliberately no Cypher-generation prompt here. Cypher is never
-produced by an LLM in this project -- every query the API can run is one
+Every query the API can run is one
 of the fixed, hand-written templates in `app/core/cypher_library.py`
 (cataloged in full in `CYPHER.md`), selected by a rule-based matcher.
 The LLM's only job is turning already-retrieved, already-safe rows into
