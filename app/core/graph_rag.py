@@ -148,6 +148,22 @@ RETURN start, r, neighbor LIMIT {limit}
 """
 
 
+def _serialize_properties(value: object) -> object:
+    """Convert Neo4j node/relationship properties into plain Python values."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {key: _serialize_properties(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_serialize_properties(item) for item in value]
+    if hasattr(value, "items"):
+        try:
+            return {key: _serialize_properties(item) for key, item in value.items()}
+        except TypeError:
+            return str(value)
+    return value
+
+
 def build_subgraph(db: Neo4jClient, results: list[dict]) -> tuple[list[dict], list[dict]]:
     """
     Best-effort extraction of a small visualizable subgraph around any
@@ -178,7 +194,9 @@ def build_subgraph(db: Neo4jClient, results: list[dict]) -> tuple[list[dict], li
     def add_node(n):
         if n is None:
             return None
-        props = dict(n)
+        props = _serialize_properties(n)
+        if not isinstance(props, dict):
+            props = {}
         name = props.get("name", "unknown")
         label = list(n.labels)[0] if hasattr(n, "labels") else "Unknown"
         node_id = f"{label}:{name}"
@@ -196,7 +214,7 @@ def build_subgraph(db: Neo4jClient, results: list[dict]) -> tuple[list[dict], li
                     "source": start_id,
                     "target": neighbor_id,
                     "type": rel.type if hasattr(rel, "type") else "RELATED",
-                    "properties": dict(rel),
+                    "properties": _serialize_properties(rel),
                 }
             )
 

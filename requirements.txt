@@ -13,6 +13,7 @@ pandas==2.2.3
 
 # --- Frontend ---
 streamlit==1.38.0
+watchdog==4.0.0
 requests==2.32.3
 pyvis==0.3.2
 

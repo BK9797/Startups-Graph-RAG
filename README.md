@@ -19,143 +19,47 @@ Query a **Neo4j Knowledge Graph** using natural language, retrieve relevant grap
 
 # 📖 Overview
 
-**Tech / Startups GraphRAG** is a lightweight Retrieval-Augmented Generation (RAG) application built on top of a **Neo4j Knowledge Graph**.
+This project is a lightweight GraphRAG app for asking natural-language questions about a startup/tech knowledge graph stored in Neo4j.
 
-Instead of asking an LLM to invent database queries, the system first retrieves the most relevant graph entities using **embedding similarity** and **Neo4j Full-Text Search**, builds a graph context, and finally asks **Groq LLM** to generate an answer **grounded only in the retrieved data**.
+The flow is simple:
 
-This architecture provides:
+1. The question is matched against graph entity names using embedding similarity.
+2. Relevant entities are retrieved from Neo4j.
+3. A Groq model generates a grounded answer from that retrieved context.
 
-- ⚡ Fast retrieval
-- 🎯 Accurate graph-based answers
-- 🔒 No hallucinated database queries
-- 🧠 Context-aware natural language responses
-
----
-
-# ✨ Features
-
-- 💬 Natural language question answering
-- 🕸️ Neo4j Knowledge Graph backend
-- 🔎 Embedding-based entity retrieval
-- 📚 Neo4j Full-Text Search fallback
-- 🤖 Groq LLM answer synthesis
-- 🚀 FastAPI REST API
-- 🎨 Interactive Streamlit frontend
-- 🧪 Automated testing with Pytest
-- ☁️ Ready for Railway deployment
-
----
-
-# 🏗️ System Architecture
-
-```text
-                Natural Language Question
-                          │
-                          ▼
-                 Embedding Similarity Search
-                          │
-                          ▼
-                Neo4j Full-Text Search (Fallback)
-                          │
-                          ▼
-              Retrieve Relevant Graph Entities
-                          │
-                          ▼
-                  Build Graph Context
-                          │
-                          ▼
-              Groq LLM (Grounded Generation)
-                          │
-                          ▼
-                    Natural Language Answer
-```
-
----
-
-# 🛠️ Tech Stack
-
-| Category | Technology |
-|----------|------------|
-| **Backend** | FastAPI |
-| **Database** | Neo4j |
-| **Vector Retrieval** | Embedding Similarity |
-| **Search** | Neo4j Full-Text Index |
-| **LLM** | Groq |
-| **Frontend** | Streamlit |
-| **Testing** | Pytest |
-| **Deployment** | Railway |
-
----
-
-# 📂 Project Structure
-
-```text
-Startups-Graph-RAG
-│
-├── app
-│   ├── api
-│   │   └── routes.py
-│   ├── core
-│   │   ├── embedding.py
-│   │   ├── graph_rag.py
-│   │   └── llm.py
-│   ├── db
-│   │   └── neo4j_client.py
-│   ├── frontend
-│   │   └── streamlit_app.py
-│   └── main.py
-│
-├── scripts
-│   └── load_neo4j.py
-│
-├── tests
-│
-├── requirements.txt
-└── README.md
-```
+This keeps the answers focused on the graph data instead of relying on the model to invent facts.
 
 ---
 
 # ⚡ Quick Start
 
-## 1️⃣ Clone the Repository
+## 1. Clone and enter the repo
 
 ```bash
 git clone https://github.com/BK9797/Startups-Graph-RAG.git
-
 cd Startups-Graph-RAG
 ```
 
----
-
-## 2️⃣ Create a Virtual Environment
+## 2. Create and activate a virtual environment
 
 ```bash
 python -m venv .venv
-
-source .venv/bin/activate      # Linux / macOS
-
-# Windows
-.venv\Scripts\activate
+source .venv/bin/activate
 ```
 
----
-
-## 3️⃣ Install Dependencies
+## 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-## 4️⃣ Configure Environment Variables
+## 4. Configure environment variables
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and provide:
+Set at least these values in `.env`:
 
 ```text
 NEO4J_URI=
@@ -164,43 +68,27 @@ NEO4J_PASSWORD=
 GROQ_API_KEY=
 ```
 
----
-
-## 5️⃣ Run the Backend
+## 5. Run the backend
 
 ```bash
 make api
 ```
 
-The API will be available at
+Open:
+- API: http://localhost:8000
+- Docs: http://localhost:8000/docs
 
-```
-http://localhost:8000
-```
-
-Interactive Swagger documentation:
-
-```
-http://localhost:8000/docs
-```
-
----
-
-# 🎨 Streamlit Frontend
-
-Launch the interactive interface:
+## 6. Run the frontend
 
 ```bash
-streamlit run app/frontend/streamlit_app.py
+./.venv/bin/python -m streamlit run app/frontend/streamlit_app.py --server.port 8501 --server.address 127.0.0.1
 ```
 
-The Streamlit application provides an intuitive chat interface for querying the graph using natural language.
+Open: http://127.0.0.1:8501
 
 ---
 
 # 🧪 Run Tests
-
-Execute the complete test suite:
 
 ```bash
 make test
@@ -208,56 +96,44 @@ make test
 
 ---
 
-# 💬 Example API Request
+# 💬 Example
+
+Request:
 
 ```json
 {
-    "question": "Who founded NovaPay?"
+  "question": "Who founded NovaPay?"
+}
+```
+
+Response idea:
+
+```json
+{
+  "answer": "NovaPay was founded by Elena Rossi in 2016.",
+  "template_id": "embedding"
 }
 ```
 
 ---
 
-# ✅ Example Response
+# 🔑 Key Points
 
-```json
-{
-    "answer": "NovaPay was founded by Elena Rossi in 2016.",
-    "template_id": "embedding"
-}
-```
-
----
-
-
-# 📌 Key Design Decisions
-
-### 🔹 Embedding-First Retrieval
-
-The system first retrieves semantically similar entities using vector embeddings before falling back to Neo4j Full-Text Search.
-
-### 🔹 Grounded Generation
-
-Groq receives **only the retrieved graph context**, ensuring responses remain faithful to the underlying knowledge graph.
-
-### 🔹 Lightweight Graph Context
-
-Only the most relevant nodes and relationships are included in the prompt, keeping responses fast and reducing unnecessary context.
-
-### 🔹 No LLM-Generated Cypher
-
-The language model never writes Cypher queries or directly interacts with the database.
+- The app uses embedding-based retrieval first.
+- Neo4j full-text search is used as a fallback helper.
+- The LLM only synthesizes answers from retrieved graph context.
+- It is designed to be simple, local-first, and easy to run.
 
 ---
 
 # 👨‍💻 Author
 
-**Bishoy Kamel**
+Bishoy Kamel
 
 AI Engineer
 
-- 💼 LinkedIn: https://www.linkedin.com/in/bishoy-kamel-5b53a6254/
-- 🐙 GitHub: https://github.com/BK9797
+- LinkedIn: https://www.linkedin.com/in/bishoy-kamel-5b53a6254/
+- GitHub: https://github.com/BK9797
 
 ---
 

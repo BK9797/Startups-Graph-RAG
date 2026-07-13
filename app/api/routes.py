@@ -60,6 +60,7 @@ def health(
     return HealthResponse(status=overall, components=components, version=__version__)
 
 
+@router.post("/ask", response_model=AnswerResponse, summary="Backward-compatible alias for /answer")
 @router.post("/answer", response_model=AnswerResponse, summary="Ask a natural-language question about the graph")
 def answer(
     payload: AnswerRequest,

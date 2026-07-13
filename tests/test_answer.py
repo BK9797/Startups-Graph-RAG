@@ -34,6 +34,21 @@ def test_validate_cypher_accepts_parameterized_limit():
     assert result.valid is True
 
 
+def test_ask_endpoint_alias_returns_answer(fake_neo4j_client):
+    """The legacy /ask endpoint should remain compatible with the current /answer API."""
+    fake_neo4j_client.run_read.return_value = [{"label": "Company", "name": "NovaPay"}]
+    app.dependency_overrides[get_neo4j_client] = lambda: fake_neo4j_client
+    client = TestClient(app)
+
+    with patch("app.core.graph_rag.synthesize_answer", return_value="Elena Rossi founded NovaPay in 2016."):
+        resp = client.post("/ask", json={"question": "Who founded NovaPay?"})
+
+    app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["answer"] == "Elena Rossi founded NovaPay in 2016."
+
+
 def test_answer_endpoint_end_to_end(fake_neo4j_client):
     """An embedding-based similarity search returns candidate entities and the answer is synthesized from them."""
     fake_neo4j_client.run_read.return_value = [{"label": "Company", "name": "NovaPay"}]

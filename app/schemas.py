@@ -40,7 +40,7 @@ class GraphEdge(BaseModel):
     source: str
     target: str
     type: str
-    properties: dict[str, Any] = Field(default_factory=dict)
+    properties: Any = Field(default_factory=dict)
 
 
 class Subgraph(BaseModel):
