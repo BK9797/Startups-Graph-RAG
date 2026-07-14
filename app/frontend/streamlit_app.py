@@ -13,13 +13,13 @@ Railway from the frontend).
 
 from __future__ import annotations
 
+import base64
 import os
 import time
 
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from pyvis.network import Network
 
 DEFAULT_BACKEND = os.environ.get("BACKEND_URL", "http://localhost:8000")
@@ -108,6 +108,23 @@ def render_subgraph(subgraph: dict) -> str | None:
         if e["source"] in node_ids and e["target"] in node_ids:
             net.add_edge(e["source"], e["target"], label=e["type"], color="#888888", arrows="to")
     return net.generate_html(notebook=False)
+
+
+def embed_html(html: str, height: int = 470) -> None:
+    """Render an HTML string inside a sandboxed iframe using a data URI.
+
+    This avoids ``streamlit.components.v1.html()``, which spawns a background
+    HTTP server subprocess — the subprocess fork triggers macOS's Objective-C
+    runtime fork-safety restriction, causing a segmentation fault after the
+    first question is answered.
+    """
+    b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+    st.markdown(
+        f'<iframe src="data:text/html;base64,{b64}" '
+        f'width="100%" height="{height}" frameborder="0" '
+        f'style="border-radius:8px;"></iframe>',
+        unsafe_allow_html=True,
+    )
 
 
 def status_badge(status: str) -> str:
@@ -213,7 +230,7 @@ for turn in st.session_state.history:
             subgraph = turn.get("subgraph")
             html = render_subgraph(subgraph) if subgraph else None
             if html:
-                components.html(html, height=470, scrolling=False)
+                embed_html(html, height=470)
             else:
                 st.info("No subgraph available for this answer.")
 
@@ -261,7 +278,7 @@ if question:
             with tab_graph:
                 html = render_subgraph(data["subgraph"]) if data.get("subgraph") else None
                 if html:
-                    components.html(html, height=470, scrolling=False)
+                    embed_html(html, height=470)
                 else:
                     st.info("No subgraph available for this answer.")
 

@@ -41,14 +41,24 @@ def chat_completion(
 ) -> str:
     """Single-turn chat completion. Retries on transient Groq/network errors."""
     client = get_groq_client()
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 413 = payload too large — retrying won't help; surface immediately
+        if getattr(exc, "status_code", None) == 413:
+            raise ContextTooLargeError(str(exc)) from exc
+        raise
     content = response.choices[0].message.content or ""
     return content.strip()
+
+
+class ContextTooLargeError(RuntimeError):
+    """Raised when the assembled context exceeds the model's token limit."""

@@ -81,7 +81,7 @@ Open:
 ## 6. Run the frontend
 
 ```bash
-./.venv/bin/python -m streamlit run app/frontend/streamlit_app.py --server.port 8501 --server.address 127.0.0.1
+make frontend
 ```
 
 Open: http://127.0.0.1:8501
@@ -98,6 +98,8 @@ make test
 
 # 💬 Example
 
+**Example 1 — Founder lookup**
+
 Request:
 
 ```json
@@ -106,12 +108,35 @@ Request:
 }
 ```
 
-Response idea:
+Response:
 
 ```json
 {
   "answer": "NovaPay was founded by Elena Rossi in 2016.",
-  "template_id": "embedding"
+  "model_used": "llama-3.3-70b-versatile",
+  "latency_ms": 1240
+}
+```
+
+---
+
+**Example 2 — Investor portfolio**
+
+Request:
+
+```json
+{
+  "question": "What companies has Sequoia Trail invested in?"
+}
+```
+
+Response:
+
+```json
+{
+  "answer": "Sequoia Trail has invested in the following companies: HealthLoop (Series A, $26 million, 2016), DataForge (Series A, $20 million, 2015).",
+  "model_used": "llama-3.3-70b-versatile",
+  "latency_ms": 1380
 }
 ```
 

@@ -20,7 +20,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.core.embedding import find_best_matches
-from app.core.llm import chat_completion
+from app.core.llm import ContextTooLargeError, chat_completion
 from app.core.prompts import ANSWER_SYSTEM_PROMPT, ANSWER_USER_TEMPLATE
 from app.db.neo4j_client import Neo4jClient
 
@@ -277,6 +277,28 @@ def subgraph_to_context(subgraph: dict) -> str:
     return "\n".join(lines)
 
 
+# ~4 chars per token on average; reserve 700 output + ~600 for system+user overhead
+# → 12 000 TPM limit − 1 300 buffer = 10 700 usable input tokens ≈ 42 800 chars
+_CONTEXT_CHAR_BUDGET = 20_000  # conservative for the free tier (12 k TPM)
+
+
+def _truncate_context(context: str, budget: int = _CONTEXT_CHAR_BUDGET) -> tuple[str, bool]:
+    """Trim context to `budget` characters, cutting at a clean block boundary.
+
+    Returns ``(truncated_context, was_truncated)``.
+    """
+    if len(context) <= budget:
+        return context, False
+
+    # Try to cut at an entity-block separator to avoid mid-block cuts
+    separator = "\n\n───────────────────────────────────\n\n"
+    truncated = context[:budget]
+    last_sep = truncated.rfind(separator)
+    if last_sep > 0:
+        truncated = truncated[:last_sep]
+    return truncated, True
+
+
 def generate_answer(question: str, context: str, model: str) -> str:
     """Stage 4: LLM Reasoning — synthesise a grounded answer from the assembled context."""
     user_prompt = ANSWER_USER_TEMPLATE.format(question=question, context=context)
@@ -416,7 +438,20 @@ def answer_question(
 
     # ── Stage 4: LLM Reasoning ────────────────────────────────────────────────
     context = "\n\n───────────────────────────────────\n\n".join(context_blocks)
-    answer_text = generate_answer(question, context, model=answer_model)
+    context, was_truncated = _truncate_context(context)
+    if was_truncated:
+        warnings.append(
+            "The retrieved context was trimmed to fit the model's token limit. "
+            "Try reducing 'Max rows returned' in the sidebar for more complete results."
+        )
+    try:
+        answer_text = generate_answer(question, context, model=answer_model)
+    except ContextTooLargeError:
+        answer_text = (
+            "The graph context for this question is too large for the current model tier. "
+            "Please reduce 'Max rows returned' in the sidebar (try 5–10) and ask again."
+        )
+        warnings.append("Groq 413: context exceeded the model's token-per-minute limit.")
     latency_ms = int((time.perf_counter() - start) * 1000)
 
     result = RagResult(
