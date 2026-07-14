@@ -21,7 +21,7 @@ class HealthResponse(BaseModel):
 
 class AnswerRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000, description="Natural-language question about the graph.")
-    top_k: int = Field(default=25, ge=1, le=200, description="Max rows to pull back from Neo4j.")
+    top_k: int = Field(default=5, ge=1, le=200, description="Max rows to pull back from Neo4j.")
     include_subgraph: bool = Field(default=True, description="Whether to return a node/edge payload for graph visualization.")
     model: str | None = Field(
         default=None,

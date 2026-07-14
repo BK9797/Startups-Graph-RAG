@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     # --- Embedding retrieval ---
     embedding_model: str = Field(default="BAAI/bge-small-en-v1.5", alias="EMBEDDING_MODEL")
+    default_top_k: int = Field(default=5, alias="DEFAULT_TOP_K")
 
     # --- App ---
     app_env: str = Field(default="development", alias="APP_ENV")

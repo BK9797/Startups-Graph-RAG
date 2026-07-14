@@ -19,11 +19,12 @@ app = FastAPI(
     title="Tech/Startups GraphRAG API",
     description=(
         "GraphRAG backend over a Neo4j knowledge graph of startups, founders, "
-        "investors, products, and awards. Natural-language questions are matched "
-        "against a fixed library of hand-written, read-only Cypher templates "
-        "(see CYPHER.md) -- never LLM-generated -- executed against Neo4j, and "
-        "the retrieved rows are synthesized into a grounded answer by a "
-        "Groq-hosted LLM."
+        "investors, products, and awards. Natural-language questions are answered "
+        "via a four-stage pipeline: (1) embedding-based vector search to find "
+        "relevant graph nodes, (2) multi-hop graph traversal to collect the "
+        "neighbourhood subgraph, (3) structured context assembly, and (4) a "
+        "Groq-hosted LLM that synthesises a grounded natural-language answer "
+        "from the graph context — never from LLM-generated Cypher."
     ),
     version=__version__,
 )

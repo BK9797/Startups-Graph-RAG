@@ -1,32 +1,22 @@
 """
 graph_rag.py
 =============
-Orchestrates the full pipeline for a single question:
+Vector-first GraphRAG pipeline for the startups knowledge graph.
 
-    question
-      -> match a fixed, hand-written Cypher template (app/core/cypher_library.py)
-      -> [no match] fall back to fulltext entity search
-      -> validate the resolved Cypher is read-only (defense in depth)
-      -> execute against Neo4j (parameterized, read-only transaction)
-      -> [zero rows] fall back to fulltext entity search + retry once
-      -> build a node/edge subgraph payload for the frontend visualization
-      -> (LLM) synthesize a grounded natural-language answer from the rows
-
-The LLM is used for exactly one thing: turning retrieved graph rows into
-a natural-language answer. It never sees the question with the intent of
-writing Cypher, and it never touches Neo4j -- every query that can run
-against the database is one of the fixed templates in
-`app/core/cypher_library.py` (documented in full in `CYPHER.md`) or the
-single fulltext fallback query defined below.
+Pipeline stages:
+  1. Vector Search    — find the most relevant graph nodes for the question
+  2. Graph Traversal  — walk the neighbourhood of each relevant node
+  3. Context Assembly — serialise the subgraph into structured text
+  4. LLM Reasoning    — generate a natural language answer from that context
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from app.config import get_settings
 from app.core.embedding import find_best_matches
@@ -36,12 +26,6 @@ from app.db.neo4j_client import Neo4jClient
 
 logger = logging.getLogger("app.graph_rag")
 
-# Defense-in-depth check on every resolved query before it runs, even
-# though every query originates from the fixed template library rather
-# than free-form LLM output. Catches a mistake in a template itself
-# (e.g. a future template that forgets it must be read-only) before it
-# ever reaches Neo4j, on top of `Neo4jClient.run_read` enforcing an
-# explicit READ transaction.
 FORBIDDEN_KEYWORDS = re.compile(
     r"\b(CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP|CALL\s*\{|LOAD\s+CSV|"
     r"apoc\.periodic|apoc\.create|apoc\.merge|GRANT|REVOKE|DENY)\b",
@@ -71,7 +55,7 @@ class RagResult:
 
 
 def validate_cypher(query: str) -> CypherValidation:
-    """Read-only / well-formedness check, run against every resolved query."""
+    """Read-only / well-formedness check, kept for compatibility."""
     stripped = query.strip().rstrip(";")
     if not stripped:
         return CypherValidation(False, "empty query")
@@ -87,151 +71,176 @@ def validate_cypher(query: str) -> CypherValidation:
 FULLTEXT_FALLBACK_QUERY = """
 CALL db.index.fulltext.queryNodes('entity_search', $term) YIELD node, score
 RETURN labels(node)[0] AS label, node.name AS name, score
-ORDER BY score DESC LIMIT 10
+ORDER BY score DESC LIMIT $limit
 """
 
 
+SUBGRAPH_TRAVERSAL_QUERY = """
+MATCH (start)
+WHERE labels(start)[0] = $label AND start.name = $name
+
+OPTIONAL MATCH path = (start)-[*1..{hops}]-(neighbor)
+
+WITH start,
+     collect(DISTINCT {{
+         from: startNode(last(relationships(path))).name,
+         rel:  type(last(relationships(path))),
+         to:   endNode(last(relationships(path))).name,
+         to_label: labels(endNode(last(relationships(path))))[0]
+     }}) AS edges
+
+RETURN start, labels(start)[0] AS start_label, edges
+"""
+
+
+# SYSTEM_PROMPT and ANSWER_USER_TEMPLATE are imported from app.core.prompts
+
+
+def _serialize_properties(node: Any) -> dict[str, Any]:
+    """Convert a Neo4j node object or plain dict to a plain Python dict,
+    stripping internal embedding fields."""
+    skip = {"embedding", "embedding_text"}
+    if hasattr(node, "items"):
+        items = node.items()
+    else:
+        try:
+            items = dict(node).items()
+        except Exception:  # noqa: BLE001
+            return {}
+    return {k: v for k, v in items if k not in skip and v is not None}
+
+
 def _fallback_search_term(question: str) -> str:
-    """
-    Crude but effective: use capitalized word sequences from the question
-    as the fulltext search term, falling back to the raw question if none
-    are found (e.g. an all-lowercase question).
-    """
     candidates = re.findall(r"[A-Z][a-zA-Z0-9&'\-]*(?:\s+[A-Z][a-zA-Z0-9&'\-]*)*", question)
     return " ".join(candidates) if candidates else question
 
 
-def fallback_entity_search(db: Neo4jClient, question: str) -> list[dict]:
-    """
-    Used when either (a) no Cypher template matched the question, or
-    (b) a template matched but its query returned zero rows -- usually
-    because the entity name in the question doesn't exactly match the
-    stored name (typo, partial name, different casing). Runs a fulltext
-    search over node names/descriptions to surface the closest matching
-    entities instead of just returning "no results".
-    """
+def fallback_entity_search(db: Neo4jClient, question: str, top_k: int = 5) -> list[dict]:
+    """Fulltext-index fallback when embedding search returns no results."""
     term = _fallback_search_term(question)
     try:
-        return db.run_read(FULLTEXT_FALLBACK_QUERY, {"term": term + "~"})
+        return db.run_read(FULLTEXT_FALLBACK_QUERY, {"term": term + "~", "limit": top_k})
     except Exception as exc:  # noqa: BLE001
         logger.info("Fulltext fallback failed (index may not exist yet): %s", exc)
         return []
 
 
-def embedding_fallback_search(db: Neo4jClient, question: str) -> list[dict]:
-    """Use deterministic embeddings to rank entity names when fulltext search is unavailable."""
+def embedding_fallback_search(db: Neo4jClient, question: str, top_k: int = 5) -> list[dict]:
+    """Pure embedding fallback — no fulltext index required."""
     try:
         rows = db.run_read(
-            "MATCH (n) WHERE n.name IS NOT NULL AND labels(n)[0] IN ['Company', 'Person', 'Investor', 'Product', 'Award'] "
-            "RETURN labels(n)[0] AS label, n.name AS name LIMIT 200"
+            "MATCH (n) WHERE labels(n)[0] IN ['Company', 'Person', 'Investor', 'Product', 'Award'] "
+            "AND n.name IS NOT NULL "
+            "RETURN labels(n)[0] AS label, n.name AS name LIMIT 500"
         )
     except Exception as exc:  # noqa: BLE001
         logger.info("Embedding fallback failed: %s", exc)
         return []
 
-    names = [row.get("name") for row in rows if isinstance(row.get("name"), str)]
-    if not names:
-        return []
-
-    ranked = find_best_matches(question, names, top_k=8)
-    return [
-        {"label": "Entity", "name": name, "score": round(score, 4), "source": "embedding"}
-        for score, name in ranked
+    candidates = [
+        {"label": row.get("label", "Entity"), "name": row["name"].strip()}
+        for row in rows
+        if isinstance(row.get("name"), str) and row["name"].strip()
     ]
 
+    if not candidates:
+        return []
 
-SUBGRAPH_QUERY_TEMPLATE = """
-UNWIND $names AS n
-MATCH (start {{name: n}})
-OPTIONAL MATCH (start)-[r]-(neighbor)
-RETURN start, r, neighbor LIMIT {limit}
-"""
-
-
-def _serialize_properties(value: object) -> object:
-    """Convert Neo4j node/relationship properties into plain Python values."""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return {key: _serialize_properties(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_serialize_properties(item) for item in value]
-    if hasattr(value, "items"):
-        try:
-            return {key: _serialize_properties(item) for key, item in value.items()}
-        except TypeError:
-            return str(value)
-    return value
+    ranked = find_best_matches(question, [item["name"] for item in candidates], top_k=top_k)
+    found = []
+    for score, name in ranked:
+        label = next((item["label"] for item in candidates if item["name"] == name), "Entity")
+        found.append({"label": label, "name": name, "score": round(score, 4), "source": "embedding"})
+    return found
 
 
-def build_subgraph(db: Neo4jClient, results: list[dict]) -> tuple[list[dict], list[dict]]:
-    """
-    Best-effort extraction of a small visualizable subgraph around any
-    entity names present in the flat query results. This lets the
-    frontend draw an interactive graph next to the text answer.
-    """
-    names: set[str] = set()
-    for row in results:
-        for value in row.values():
-            if isinstance(value, str) and len(value) < 100:
-                names.add(value)
-            elif isinstance(value, list):
-                for v in value:
-                    if isinstance(v, str) and len(v) < 100:
-                        names.add(v)
-    if not names:
-        return [], []
-
+def find_top_nodes(db: Neo4jClient, question: str, top_k: int = 5) -> list[dict]:
+    """Stage 1: Vector Search — fetch candidate nodes then rank by embedding similarity."""
     try:
-        rows = db.run_read(SUBGRAPH_QUERY_TEMPLATE.format(limit=150), {"names": list(names)[:20]})
+        rows = db.run_read(
+            "MATCH (n) WHERE labels(n)[0] IN ['Company', 'Person', 'Investor', 'Product', 'Award'] "
+            "AND n.name IS NOT NULL "
+            "RETURN labels(n)[0] AS label, n.name AS name LIMIT 500"
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.info("Subgraph enrichment query failed: %s", exc)
-        return [], []
+        logger.info("Vector search failed: %s", exc)
+        return []
 
-    nodes: dict[str, dict] = {}
-    edges: list[dict] = []
+    candidates = [
+        {"label": row.get("label", "Entity"), "name": row["name"].strip()}
+        for row in rows
+        if isinstance(row.get("name"), str) and row["name"].strip()
+    ]
 
-    def add_node(n):
-        if n is None:
-            return None
-        props = _serialize_properties(n)
-        if not isinstance(props, dict):
-            props = {}
-        name = props.get("name", "unknown")
-        label = list(n.labels)[0] if hasattr(n, "labels") else "Unknown"
-        node_id = f"{label}:{name}"
-        if node_id not in nodes:
-            nodes[node_id] = {"id": node_id, "label": label, "name": name, "properties": props}
-        return node_id
+    if not candidates:
+        return []
 
-    for row in rows:
-        start_id = add_node(row.get("start"))
-        neighbor_id = add_node(row.get("neighbor"))
-        rel = row.get("r")
-        if rel is not None and start_id and neighbor_id:
-            edges.append(
-                {
-                    "source": start_id,
-                    "target": neighbor_id,
-                    "type": rel.type if hasattr(rel, "type") else "RELATED",
-                    "properties": _serialize_properties(rel),
-                }
-            )
-
-    return list(nodes.values()), edges
+    ranked = find_best_matches(question, [item["name"] for item in candidates], top_k=top_k)
+    found: list[dict] = []
+    for score, name in ranked:
+        label = next((item["label"] for item in candidates if item["name"] == name), "Entity")
+        found.append({"label": label, "name": name, "score": round(score, 4), "source": "embedding"})
+    return found
 
 
-def synthesize_answer(question: str, results: list[dict], model: str) -> str:
-    settings = get_settings()
-    results_json = "[]" if not results else json.dumps(results, default=str, indent=2)[:6000]
-    user_prompt = ANSWER_USER_TEMPLATE.format(
-        question=question, row_count=len(results), results_json=results_json
+def retrieve_subgraph(node_name: str, node_label: str, db: Neo4jClient, hops: int = 2) -> dict:
+    query = SUBGRAPH_TRAVERSAL_QUERY.format(hops=hops)
+    try:
+        rows = db.run_read(query, {"name": node_name, "label": node_label})
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Subgraph traversal failed: %s", exc)
+        return {}
+
+    if not rows:
+        return {}
+
+    row = rows[0]
+    return {
+        "center": row.get("start") or {},
+        "label": row.get("start_label", node_label),
+        "edges": [e for e in row.get("edges", []) if isinstance(e, dict) and e.get("from") and e.get("to")],
+    }
+
+
+def subgraph_to_context(subgraph: dict) -> str:
+    if not subgraph or not subgraph.get("center"):
+        return ""
+
+    center = subgraph["center"]
+    label = subgraph.get("label", "")
+    skip = {"embedding", "embedding_text"}
+    props = ", ".join(
+        f"{k}={v}"
+        for k, v in center.items()
+        if k not in skip and v is not None
     )
+
+    lines = [
+        f"ENTITY: {center.get('name', 'Unknown')} [{label}]",
+        f"Properties: {props}",
+        "",
+        "CONNECTIONS:",
+    ]
+
+    seen: set[tuple[str, str, str]] = set()
+    for edge in subgraph.get("edges", []):
+        triple = (edge["from"], edge["rel"], edge["to"])
+        if triple in seen:
+            continue
+        seen.add(triple)
+        lines.append(f"  • {edge['from']}  –[{edge['rel']}]→  {edge['to']}")
+
+    return "\n".join(lines)
+
+
+def generate_answer(question: str, context: str, model: str) -> str:
+    """Stage 4: LLM Reasoning — synthesise a grounded answer from the assembled context."""
+    user_prompt = ANSWER_USER_TEMPLATE.format(question=question, context=context)
     return chat_completion(
         system_prompt=ANSWER_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         model=model,
-        temperature=settings.groq_temperature_answer,
+        temperature=get_settings().groq_temperature_answer,
         max_tokens=700,
     )
 
@@ -247,11 +256,8 @@ def _unanswerable_result(question: str, answer_model: str, warnings: list[str], 
         results=[],
         warnings=warnings,
         answer=(
-            "I wasn't able to match that question to one of the graph's predefined "
-            "query templates, and a fulltext search didn't surface a close entity "
-            "match either. Try rephrasing it to reference a specific company, "
-            "person, investor, product, or award by name -- for example "
-            "\"Who founded NovaPay?\" or \"Which investors backed GreenGrid?\"."
+            "I couldn't find any relevant entities in the knowledge graph for that question. "
+            "Try asking about a specific company, person, investor, product, or award."
         ),
         model_used=answer_model,
         latency_ms=latency_ms,
@@ -261,7 +267,7 @@ def _unanswerable_result(question: str, answer_model: str, warnings: list[str], 
 def answer_question(
     db: Neo4jClient,
     question: str,
-    top_k: int = 25,
+    top_k: int = 5,
     include_subgraph: bool = True,
     model_override: str | None = None,
 ) -> RagResult:
@@ -271,36 +277,82 @@ def answer_question(
     max_rows = max(1, min(top_k, settings.max_cypher_rows))
     warnings: list[str] = []
 
-    fallback_rows = embedding_fallback_search(db, question)
-    if not fallback_rows:
-        return _unanswerable_result(question, answer_model, warnings, start)
+    results = find_top_nodes(db, question, top_k=max_rows)
+    used_fallback = False
 
-    warnings.append(
-        "Showing closest-matching entities from an embedding-based similarity search."
-    )
-    cypher, cypher_params = "", {}
-    retrieval_mode = "embedding"
+    if not results:
+        fallback_rows = fallback_entity_search(db, question, top_k=max_rows)
+        if not fallback_rows:
+            fallback_rows = embedding_fallback_search(db, question, top_k=max_rows)
+        if not fallback_rows:
+            return _unanswerable_result(question, answer_model, warnings, start)
 
-    results = fallback_rows
-    used_fallback = True
+        warnings.append(
+            "Showing closest-matching entities from an embedding-based similarity search."
+        )
+        results = fallback_rows
+        used_fallback = True
 
-    if any(row.get("data_quality") == "placeholder" for row in results if isinstance(row, dict)):
-        warnings.append("Some results reference placeholder nodes created from incomplete source data.")
+    subgraph_nodes: list[dict] = []
+    subgraph_edges: list[dict] = []
+    context_blocks: list[str] = []
+    node_ids: set[str] = set()
 
-    subgraph_nodes, subgraph_edges = ([], [])
     if include_subgraph and results:
-        subgraph_nodes, subgraph_edges = build_subgraph(db, results)
+        for node in results:
+            sg = retrieve_subgraph(node["name"], node.get("label", "Entity"), db, hops=2)
+            if not sg or not sg.get("center"):
+                continue
 
-    answer_text = synthesize_answer(question, results, answer_model)
+            block = subgraph_to_context(sg)
+            if block:
+                context_blocks.append(block)
 
+            center = sg["center"]
+            center_props = _serialize_properties(center)
+            center_label = sg.get("label", "Entity")
+            center_name = center_props.get("name") or center_props.get("title", "unknown")
+            center_id = f"{center_label}:{center_name}"
+            if center_id not in node_ids:
+                node_ids.add(center_id)
+                subgraph_nodes.append({
+                    "id": center_id,
+                    "label": center_label,
+                    "name": center_name,
+                    "properties": center_props,
+                })
+
+            for edge in sg.get("edges", []):
+                target_label = edge.get("to_label") or "Unknown"
+                target_name = edge.get("to")
+                if not target_name:
+                    continue
+                target_id = f"{target_label}:{target_name}"
+                if target_id not in node_ids:
+                    node_ids.add(target_id)
+                    subgraph_nodes.append({
+                        "id": target_id,
+                        "label": target_label,
+                        "name": target_name,
+                        "properties": {},
+                    })
+                subgraph_edges.append({
+                    "source": center_id,
+                    "target": target_id,
+                    "type": edge.get("rel") or "RELATED",
+                    "properties": {"to_label": target_label},
+                })
+
+    context = "\n\n───────────────────────────────────\n\n".join(context_blocks)
+    answer_text = generate_answer(question, context, model=answer_model)
     latency_ms = int((time.perf_counter() - start) * 1000)
 
     result = RagResult(
         question=question,
-        cypher=cypher,
-        cypher_params=cypher_params,
+        cypher="",
+        cypher_params={},
         cypher_valid=True,
-        retrieval_mode=retrieval_mode,
+        retrieval_mode="embedding",
         results=results,
         used_fallback_search=used_fallback,
         warnings=warnings,
