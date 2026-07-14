@@ -26,6 +26,10 @@ from app.db.neo4j_client import Neo4jClient
 
 logger = logging.getLogger("app.graph_rag")
 
+# ── Schema ─────────────────────────────────────────────────────────────────
+# Single source of truth for node labels present in this graph.
+NODE_LABELS: list[str] = ["Company", "Person", "Investor", "Product", "Award"]
+
 FORBIDDEN_KEYWORDS = re.compile(
     r"\b(CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP|CALL\s*\{|LOAD\s+CSV|"
     r"apoc\.periodic|apoc\.create|apoc\.merge|GRANT|REVOKE|DENY)\b",
@@ -75,25 +79,43 @@ ORDER BY score DESC LIMIT $limit
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2: Subgraph Traversal Query
+#
+# Uses a double-UNWIND pattern so that:
+#   • Multi-hop paths expose ALL intermediate edges, not just the last hop
+#   • startNode(r)/endNode(r) always reflect the true stored direction of each rel
+#   • properties(r) brings relationship metadata (role, round, amountMillion…)
+#     to the LLM context for richer, more accurate answers
+# ─────────────────────────────────────────────────────────────────────────────
 SUBGRAPH_TRAVERSAL_QUERY = """
 MATCH (start)
 WHERE labels(start)[0] = $label AND start.name = $name
 
 OPTIONAL MATCH path = (start)-[*1..{hops}]-(neighbor)
 
-WITH start,
-     collect(DISTINCT {{
-         from: startNode(last(relationships(path))).name,
-         rel:  type(last(relationships(path))),
-         to:   endNode(last(relationships(path))).name,
-         to_label: labels(endNode(last(relationships(path))))[0]
-     }}) AS edges
+WITH start, collect(DISTINCT path) AS paths
 
-RETURN start, labels(start)[0] AS start_label, edges
+UNWIND CASE WHEN size(paths) > 0 THEN paths ELSE [null] END AS p
+
+UNWIND CASE WHEN p IS NOT NULL THEN relationships(p) ELSE [null] END AS r
+
+WITH start,
+     collect(DISTINCT CASE WHEN r IS NOT NULL THEN {{
+         from:     startNode(r).name,
+         rel:      type(r),
+         to:       endNode(r).name,
+         to_label: labels(endNode(r))[0],
+         props:    properties(r)
+     }} END) AS all_edges
+
+RETURN start,
+       labels(start)[0] AS start_label,
+       [e IN all_edges WHERE e IS NOT NULL] AS edges
 """
 
 
-# SYSTEM_PROMPT and ANSWER_USER_TEMPLATE are imported from app.core.prompts
+# ANSWER_SYSTEM_PROMPT and ANSWER_USER_TEMPLATE are imported from app.core.prompts
 
 
 def _serialize_properties(node: Any) -> dict[str, Any]:
@@ -108,6 +130,24 @@ def _serialize_properties(node: Any) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             return {}
     return {k: v for k, v in items if k not in skip and v is not None}
+
+
+def _format_rel_props(props: dict[str, Any]) -> str:
+    """Render relationship property dict as a compact human-readable string.
+
+    Booleans are shown as Yes/No. Internal / embedding fields are skipped.
+    Example output:  role=CEO, current=Yes
+    """
+    skip = {"embedding", "embedding_text"}
+    parts = []
+    for k, v in props.items():
+        if k in skip or v is None:
+            continue
+        if isinstance(v, bool):
+            parts.append(f"{k}={'Yes' if v else 'No'}")
+        else:
+            parts.append(f"{k}={v}")
+    return ", ".join(parts)
 
 
 def _fallback_search_term(question: str) -> str:
@@ -125,40 +165,17 @@ def fallback_entity_search(db: Neo4jClient, question: str, top_k: int = 5) -> li
         return []
 
 
-def embedding_fallback_search(db: Neo4jClient, question: str, top_k: int = 5) -> list[dict]:
-    """Pure embedding fallback — no fulltext index required."""
-    try:
-        rows = db.run_read(
-            "MATCH (n) WHERE labels(n)[0] IN ['Company', 'Person', 'Investor', 'Product', 'Award'] "
-            "AND n.name IS NOT NULL "
-            "RETURN labels(n)[0] AS label, n.name AS name LIMIT 500"
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.info("Embedding fallback failed: %s", exc)
-        return []
-
-    candidates = [
-        {"label": row.get("label", "Entity"), "name": row["name"].strip()}
-        for row in rows
-        if isinstance(row.get("name"), str) and row["name"].strip()
-    ]
-
-    if not candidates:
-        return []
-
-    ranked = find_best_matches(question, [item["name"] for item in candidates], top_k=top_k)
-    found = []
-    for score, name in ranked:
-        label = next((item["label"] for item in candidates if item["name"] == name), "Entity")
-        found.append({"label": label, "name": name, "score": round(score, 4), "source": "embedding"})
-    return found
-
-
 def find_top_nodes(db: Neo4jClient, question: str, top_k: int = 5) -> list[dict]:
-    """Stage 1: Vector Search — fetch candidate nodes then rank by embedding similarity."""
+    """Stage 1: Vector Search — fetch candidate nodes then rank by embedding similarity.
+
+    Fetches all named nodes from the known label set, ranks them against
+    the question using a combined embedding + keyword-overlap score, and
+    returns the top-k hits.
+    """
+    labels_literal = ", ".join(f"'{lbl}'" for lbl in NODE_LABELS)
     try:
         rows = db.run_read(
-            "MATCH (n) WHERE labels(n)[0] IN ['Company', 'Person', 'Investor', 'Product', 'Award'] "
+            f"MATCH (n) WHERE labels(n)[0] IN [{labels_literal}] "
             "AND n.name IS NOT NULL "
             "RETURN labels(n)[0] AS label, n.name AS name LIMIT 500"
         )
@@ -184,6 +201,13 @@ def find_top_nodes(db: Neo4jClient, question: str, top_k: int = 5) -> list[dict]
 
 
 def retrieve_subgraph(node_name: str, node_label: str, db: Neo4jClient, hops: int = 2) -> dict:
+    """Stage 2: Graph Traversal — collect all edges within `hops` of the start node.
+
+    Returns a dict with keys:
+        center  — Neo4j node object for the starting entity
+        label   — label string of the starting entity
+        edges   — list of {from, rel, to, to_label, props} dicts
+    """
     query = SUBGRAPH_TRAVERSAL_QUERY.format(hops=hops)
     try:
         rows = db.run_read(query, {"name": node_name, "label": node_label})
@@ -198,11 +222,22 @@ def retrieve_subgraph(node_name: str, node_label: str, db: Neo4jClient, hops: in
     return {
         "center": row.get("start") or {},
         "label": row.get("start_label", node_label),
-        "edges": [e for e in row.get("edges", []) if isinstance(e, dict) and e.get("from") and e.get("to")],
+        "edges": [
+            e for e in row.get("edges", [])
+            if isinstance(e, dict) and e.get("from") and e.get("to")
+        ],
     }
 
 
 def subgraph_to_context(subgraph: dict) -> str:
+    """Stage 3: Context Assembly — serialise a subgraph into LLM-readable text.
+
+    Format:
+        ENTITY: <name> [<label>]
+        Properties: key=value, ...
+        CONNECTIONS:
+          • Source –[RELATIONSHIP]→ Target  (prop=val, ...)
+    """
     if not subgraph or not subgraph.get("center"):
         return ""
 
@@ -228,7 +263,16 @@ def subgraph_to_context(subgraph: dict) -> str:
         if triple in seen:
             continue
         seen.add(triple)
-        lines.append(f"  • {edge['from']}  –[{edge['rel']}]→  {edge['to']}")
+
+        # Surface relationship properties to the LLM
+        rel_props = {
+            k: v for k, v in (edge.get("props") or {}).items()
+            if k not in skip and v is not None
+        }
+        prop_str = _format_rel_props(rel_props)
+        suffix = f"  ({prop_str})" if prop_str else ""
+
+        lines.append(f"  • {edge['from']}  –[{edge['rel']}]→  {edge['to']}{suffix}")
 
     return "\n".join(lines)
 
@@ -271,32 +315,36 @@ def answer_question(
     include_subgraph: bool = True,
     model_override: str | None = None,
 ) -> RagResult:
+    """Answer a question about the startup ecosystem using the full GraphRAG pipeline.
+
+    Returns a RagResult with the answer, retrieved nodes, and (optionally) a
+    subgraph payload for visualization.
+    """
     settings = get_settings()
     start = time.perf_counter()
     answer_model = model_override or settings.groq_answer_model
     max_rows = max(1, min(top_k, settings.max_cypher_rows))
     warnings: list[str] = []
 
+    # ── Stage 1: Vector Search ────────────────────────────────────────────────
     results = find_top_nodes(db, question, top_k=max_rows)
     used_fallback = False
 
     if not results:
+        # Try fulltext index; embedding search IS find_top_nodes, so skip re-running it
         fallback_rows = fallback_entity_search(db, question, top_k=max_rows)
         if not fallback_rows:
-            fallback_rows = embedding_fallback_search(db, question, top_k=max_rows)
-        if not fallback_rows:
             return _unanswerable_result(question, answer_model, warnings, start)
-
-        warnings.append(
-            "Showing closest-matching entities from an embedding-based similarity search."
-        )
+        warnings.append("Showing closest-matching entities from a fulltext similarity search.")
         results = fallback_rows
         used_fallback = True
 
+    # ── Stages 2 & 3: Graph Traversal + Context Assembly ─────────────────────
     subgraph_nodes: list[dict] = []
     subgraph_edges: list[dict] = []
     context_blocks: list[str] = []
-    node_ids: set[str] = set()
+    # name → node_id: used to resolve correct source/target for visualization edges
+    name_to_id: dict[str, str] = {}
 
     if include_subgraph and results:
         for node in results:
@@ -311,10 +359,11 @@ def answer_question(
             center = sg["center"]
             center_props = _serialize_properties(center)
             center_label = sg.get("label", "Entity")
-            center_name = center_props.get("name") or center_props.get("title", "unknown")
+            center_name = center_props.get("name", "unknown")
             center_id = f"{center_label}:{center_name}"
-            if center_id not in node_ids:
-                node_ids.add(center_id)
+
+            if center_name not in name_to_id:
+                name_to_id[center_name] = center_id
                 subgraph_nodes.append({
                     "id": center_id,
                     "label": center_label,
@@ -323,26 +372,49 @@ def answer_question(
                 })
 
             for edge in sg.get("edges", []):
-                target_label = edge.get("to_label") or "Unknown"
+                source_name = edge.get("from")
                 target_name = edge.get("to")
-                if not target_name:
+                target_label = edge.get("to_label") or "Unknown"
+                if not source_name or not target_name:
                     continue
+
+                # Register target node if unseen
                 target_id = f"{target_label}:{target_name}"
-                if target_id not in node_ids:
-                    node_ids.add(target_id)
+                if target_name not in name_to_id:
+                    name_to_id[target_name] = target_id
                     subgraph_nodes.append({
                         "id": target_id,
                         "label": target_label,
                         "name": target_name,
                         "properties": {},
                     })
+
+                # Register source node if it's a neighbor not yet seen (2-hop edges)
+                if source_name not in name_to_id:
+                    source_id = f"Unknown:{source_name}"
+                    name_to_id[source_name] = source_id
+                    subgraph_nodes.append({
+                        "id": source_id,
+                        "label": "Unknown",
+                        "name": source_name,
+                        "properties": {},
+                    })
+
+                # Use actual edge direction from the graph, not always from center
+                edge_props = dict(edge.get("props") or {})
+                edge_props["to_label"] = target_label
                 subgraph_edges.append({
-                    "source": center_id,
-                    "target": target_id,
+                    "source": name_to_id[source_name],
+                    "target": name_to_id[target_name],
                     "type": edge.get("rel") or "RELATED",
-                    "properties": {"to_label": target_label},
+                    "properties": edge_props,
                 })
 
+    # ── Guard: don't call LLM with empty context ──────────────────────────────
+    if not context_blocks:
+        return _unanswerable_result(question, answer_model, warnings, start)
+
+    # ── Stage 4: LLM Reasoning ────────────────────────────────────────────────
     context = "\n\n───────────────────────────────────\n\n".join(context_blocks)
     answer_text = generate_answer(question, context, model=answer_model)
     latency_ms = int((time.perf_counter() - start) * 1000)
